@@ -1,3 +1,2 @@
-tesseract-ocr-core
-tesseract-ocr-eng
+tesseract-ocr
 libgl1
