@@ -5,7 +5,7 @@ import pytesseract
 import re
 
 # ==========================================
-# CẤU HÌNH XỬ LÝ ẢNH
+# CẤU HÌNH & HÀM PHỤ TRỢ
 # ==========================================
 
 def clean_text(text):
@@ -16,9 +16,7 @@ def sort_contours_grid(cnts, row_sensitivity=10):
     """Sắp xếp contour theo lưới (Trái->Phải, Trên->Dưới)"""
     boundingBoxes = [cv2.boundingRect(c) for c in cnts]
     c_boxes = list(zip(cnts, boundingBoxes))
-    
-    # Sắp xếp theo Y (chiều dọc)
-    c_boxes.sort(key=lambda b: b[1][1])
+    c_boxes.sort(key=lambda b: b[1][1]) # Sắp xếp theo Y trước
 
     rows = []
     current_row = []
@@ -30,7 +28,7 @@ def sort_contours_grid(cnts, row_sensitivity=10):
             current_row.append((c, box))
         else:
             if current_row:
-                current_row.sort(key=lambda b: b[1][0]) # Sắp xếp hàng cũ theo X
+                current_row.sort(key=lambda b: b[1][0]) # Sắp xếp theo X
                 rows.extend(current_row)
             current_row = [(c, box)]
             last_y = y
@@ -41,51 +39,46 @@ def sort_contours_grid(cnts, row_sensitivity=10):
 
     return [item[0] for item in rows]
 
-def reconstruct_clean_image(roi):
+def get_clean_6_chars_image(roi_gray):
     """
-    Tách các ký tự chính trong ô và vẽ lại lên nền trắng sạch.
-    Mục tiêu: Loại bỏ hoàn toàn dấu ~ . , | _
+    CHIẾN THUẬT "TOP 6":
+    1. Tìm tất cả contours trong ô.
+    2. Chỉ giữ lại 6 contours có DIỆN TÍCH LỚN NHẤT.
+    3. Vẽ lại 6 contours này lên nền trắng mới tinh để OCR.
     """
-    # 1. Chuyển xám và phân ngưỡng
-    # Dùng ngưỡng cố định vì nền đã chắc chắn là trắng
-    _, thresh = cv2.threshold(roi, 150, 255, cv2.THRESH_BINARY_INV)
+    # Threshold OTSU để tách chữ đen trên nền trắng
+    _, thresh = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 2. Tìm contours bên trong ô
+    # Tìm contours
     cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Danh sách chứa (x, contour)
-    valid_chars = []
-    h_roi, w_roi = roi.shape[:2]
-    
+    if not cnts: return roi_gray
+
+    # Lưu danh sách (Diện tích, Contour)
+    candidates = []
     for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        
-        # --- BỘ LỌC KÝ TỰ RÁC ---
-        # 1. Chiều cao: Chữ cái phải cao ít nhất 35% chiều cao ô (loại bỏ . , - ~)
-        if h < h_roi * 0.35: continue
-            
-        # 2. Chiều rộng:
-        # - Phải đủ rộng (> 4px) để loại bỏ gạch đứng | hoặc nhiễu
-        # - Không được quá rộng (> 80% ô) để loại bỏ viền dính
-        if w < 4 or w > w_roi * 0.8: continue
-        
-        # 3. Diện tích: Phải đủ lớn
-        if w * h < 50: continue
-
-        valid_chars.append((x, c))
-
-    # Sắp xếp theo thứ tự trái sang phải
-    valid_chars.sort(key=lambda k: k[0])
+        area = cv2.contourArea(c)
+        if area > 10: # Bỏ nhiễu cực nhỏ
+            candidates.append((area, c))
     
-    # Giới hạn lấy tối đa 6 ký tự (nếu bộ lọc vẫn sót)
-    # Thường thì bộ lọc chiều cao đã loại hết rác rồi
-    final_chars = [item[1] for item in valid_chars[:6]]
-
-    # 3. Vẽ lại ảnh sạch
-    clean_img = np.ones((h_roi, w_roi), dtype=np.uint8) * 255 # Nền trắng
-    cv2.drawContours(clean_img, final_chars, -1, 0, -1) # Vẽ chữ màu đen
+    # Sắp xếp theo diện tích giảm dần (Lớn nhất đứng đầu)
+    candidates.sort(key=lambda x: x[0], reverse=True)
     
-    # Thêm viền trắng bao quanh cho Tesseract dễ đọc
+    # Lấy Top 6 (hoặc ít hơn nếu không đủ 6)
+    top_6 = candidates[:6]
+    
+    # Sắp xếp 6 contour này theo vị trí X (Trái -> Phải) để code đúng thứ tự
+    # item[1] là contour -> tính bounding rect của nó để lấy x
+    top_6_sorted_x = sorted(top_6, key=lambda item: cv2.boundingRect(item[1])[0])
+    
+    # Vẽ lại ảnh sạch
+    h, w = roi_gray.shape
+    clean_img = np.ones((h, w), dtype=np.uint8) * 255 # Nền trắng
+    
+    final_cnts = [item[1] for item in top_6_sorted_x]
+    cv2.drawContours(clean_img, final_cnts, -1, 0, -1) # Vẽ chữ màu đen
+    
+    # Thêm viền trắng an toàn
     clean_img = cv2.copyMakeBorder(clean_img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
     
     return clean_img
@@ -95,27 +88,25 @@ def process_image(image_file):
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, 1)
     
-    # --- BƯỚC 1: LỌC MÀU (CHỈ LẤY MÀU TRẮNG) ---
+    # 1. Xử lý ảnh để tìm khung
+    # Chuyển sang ảnh xám để check độ sáng
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Dùng HSV để bắt màu trắng (cho mask ban đầu)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    # Định nghĩa màu trắng trong HSV:
-    # Saturation thấp (0-40), Value cao (200-255)
-    lower_white = np.array([0, 0, 215])
-    upper_white = np.array([180, 40, 255])
-    
+    lower_white = np.array([0, 0, 180]) # Giảm ngưỡng Value xuống chút để bắt chắc
+    upper_white = np.array([180, 50, 255])
     mask = cv2.inRange(hsv, lower_white, upper_white)
     
-    # Làm sạch mask (xóa nhiễu li ti)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=2) # Nở vùng trắng ra chút để contour liền mạch
-
-    # --- BƯỚC 2: TÌM KHUNG Ô ---
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # QUAN TRỌNG: Dùng Morph Open với kernel LỚN để xóa chữ mảnh, chỉ giữ khối button đặc
+    kernel_size = 11 # Kích thước 11x11 sẽ xóa sạch chữ mảnh
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # Tìm contours trên mask đã làm sạch
+    cnts, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     valid_contours = []
-    boxes_info = [] # Lưu (area, contour) để tính toán thống kê
-    
     img_h, img_w = img.shape[:2]
 
     for c in cnts:
@@ -123,73 +114,59 @@ def process_image(image_file):
         area = w * h
         aspect_ratio = w / float(h)
         
-        # Lọc thô: 
-        # - Diện tích > 1500 (bỏ chữ nhỏ rời rạc)
-        # - Tỷ lệ 2.0 < w/h < 6.0 (hình chữ nhật ngang)
-        # - Chiều rộng < 1/3 ảnh (loại bỏ banner dài ngoằng)
-        if area > 1500 and 2.0 < aspect_ratio < 6.0 and w < (img_w * 0.4):
-            valid_contours.append(c)
-            boxes_info.append(area)
+        # 1. Lọc kích thước hình học
+        if area > 1000 and 2.0 < aspect_ratio < 6.0 and w < (img_w * 0.5):
+            
+            # 2. CHỐT CHẶN: KIỂM TRA ĐỘ SÁNG NỀN (MEAN BRIGHTNESS)
+            # Cắt vùng ảnh xám
+            roi_check = gray[y:y+h, x:x+w]
+            mean_val = cv2.mean(roi_check)[0]
+            
+            # Button thật sự là nền trắng -> Mean phải rất cao (> 180)
+            # Box "Telegram" nền tối -> Mean sẽ thấp (< 100) -> BỊ LOẠI
+            if mean_val > 180:
+                valid_contours.append(c)
 
-    # --- BƯỚC 3: LỌC NGOẠI LAI (OUTLIERS) ---
-    # Các ô code thường có diện tích xấp xỉ nhau.
-    # Nếu có 1 ô quá to (banner Telegram còn sót) hoặc quá nhỏ, ta loại nó.
-    final_contours = []
-    if boxes_info:
-        median_area = np.median(boxes_info)
-        # Chỉ giữ lại các ô có diện tích lệch không quá 40% so với trung bình
-        for c in valid_contours:
-            area = cv2.contourArea(c)
-            if 0.6 * median_area < area < 1.4 * median_area:
-                final_contours.append(c)
-    else:
-        final_contours = valid_contours
-
+    # Xử lý các ô hợp lệ
     detected_codes = []
-
-    if final_contours:
-        # Sắp xếp contour
-        final_contours = sort_contours_grid(final_contours, row_sensitivity=20)
+    
+    if valid_contours:
+        # Sắp xếp thứ tự
+        valid_contours = sort_contours_grid(valid_contours, row_sensitivity=20)
         
-        # Chuyển ảnh gốc sang xám để cắt (crop)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        for idx, c in enumerate(final_contours):
+        for idx, c in enumerate(valid_contours):
             x, y, w, h = cv2.boundingRect(c)
             
-            # Cắt ảnh (Crop) - Thụt vào trong (padding) 4px để bỏ viền lờ mờ
-            pad = 4
+            # Crop
+            pad = 5
             roi = gray[y+pad:y+h-pad, x+pad:x+w-pad]
             
             if roi.size == 0: continue
-
-            # --- BƯỚC 4: TÁI TẠO & OCR ---
+            
             try:
-                clean_roi = reconstruct_clean_image(roi)
+                # --- DÙNG THUẬT TOÁN TOP 6 ---
+                clean_roi = get_clean_6_chars_image(roi)
                 
-                # Cấu hình Tesseract chỉ nhận chữ số và chữ cái
+                # OCR
                 config = r'--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
                 text = pytesseract.image_to_string(clean_roi, config=config)
                 final_code = clean_text(text)
                 
-                # Xử lý kết quả
-                if len(final_code) > 6: final_code = final_code[:6] # Cắt thừa
-                
-                detected_codes.append(final_code)
-                
-                # Vẽ lên ảnh (chỉ để hiển thị)
-                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(img, final_code, (x, y + h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                if final_code:
+                    detected_codes.append(final_code)
+                    
+                    # Vẽ kết quả
+                    cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(img, final_code, (x, y + h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             except Exception:
                 continue
 
-    return img, detected_codes, mask
+    return img, detected_codes, mask_clean
 
-# --- GIAO DIỆN STREAMLIT ---
-st.set_page_config(page_title="OKVIP Code Extractor v3", layout="wide")
-
-st.title("🧩 Tool Quét Code - Chế độ Lọc Màu Trắng")
-st.markdown("**Cập nhật:** Sử dụng bộ lọc màu HSV để chỉ bắt các ô trắng tinh, loại bỏ hoàn toàn banner Telegram và khung viền vàng.")
+# --- GIAO DIỆN ---
+st.set_page_config(page_title="OKVIP Fix Final", layout="wide")
+st.title("🧩 Tool Quét Code - Fix Lỗi Nhận Diện")
+st.markdown("Chế độ: **Top 6 Ký Tự** + **Kiểm Tra Độ Sáng Nền** (Loại bỏ box Telegram/Quà tặng)")
 
 uploaded_file = st.file_uploader("Tải ảnh lên...", type=["jpg", "png", "jpeg"])
 
@@ -199,17 +176,16 @@ if uploaded_file is not None:
     processed_img, codes, debug_mask = process_image(uploaded_file)
     
     with col1:
-        st.subheader("Kết quả trên Ảnh gốc")
+        st.subheader("Kết quả")
         st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-        
-        with st.expander("Xem Chế độ nhìn của AI (Debug Mask)"):
-            st.image(debug_mask, caption="Những vùng màu trắng là vùng AI nhìn thấy", use_container_width=True)
+        with st.expander("Debug: Mask Button (Đã lọc chữ)"):
+            st.image(debug_mask, use_container_width=True)
 
     with col2:
-        st.subheader("Danh sách Code")
+        st.subheader("Copy Code")
         if codes:
-            txt_output = "\n".join(codes)
-            st.text_area("Copy Code:", value=txt_output, height=400)
+            txt = "\n".join(codes)
+            st.text_area("Danh sách:", value=txt, height=400)
             st.success(f"Tìm thấy {len(codes)} mã.")
         else:
-            st.warning("Không tìm thấy mã nào. Hãy chắc chắn ảnh đủ sáng.")
+            st.warning("Không tìm thấy mã.")
