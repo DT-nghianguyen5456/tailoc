@@ -44,66 +44,64 @@ def process_image(image_file):
     # Chuyển sang ảnh xám
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Phân ngưỡng (Threshold) để tách phần màu trắng
-    # Các ô màu trắng sẽ có giá trị cao (gần 255)
+    # Phân ngưỡng (Threshold)
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     
-    # Tìm các đường viền (contours)
+    # Tìm contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     detected_codes = []
     valid_contours = []
 
-    # Lọc các contour để tìm đúng ô chứa mã
+    # Lọc contours
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
         aspect_ratio = w / float(h)
         
-        # Điều kiện lọc: Diện tích phải đủ lớn và hình dáng chữ nhật ngang
-        # Bạn có thể điều chỉnh số 2000 tùy theo độ phân giải ảnh
+        # Điều kiện lọc
         if area > 2000 and aspect_ratio > 2.0:
             valid_contours.append(c)
 
-    # Sắp xếp contour từ trên xuống dưới để đọc đúng thứ tự
+    # Sắp xếp và xử lý
     if valid_contours:
-        # Sắp xếp sơ bộ từ trên xuống dưới
         (valid_contours, _) = sort_contours(valid_contours, method="top-to-bottom")
         
-        # Xử lý gom nhóm từng hàng (để sắp xếp trái sang phải trong cùng 1 hàng)
-        sorted_final = []
-        # Giả sử mỗi hàng cao khoảng h pixels, ta gom nhóm các contour có y gần nhau
-        # (Đây là logic đơn giản hóa, với lưới đều nhau thì ổn)
-        # Để đơn giản cho demo, ta dùng logic sắp xếp theo tọa độ Y trước, 
-        # sau đó gom nhóm các box có Y gần nhau để sort theo X.
-        
-        # NOTE: Với lưới Grid rõ ràng như ảnh, ta có thể dùng thư viện imutils hoặc logic custom.
-        # Ở đây mình dùng logic đọc tuần tự theo bounding box đã sort top-to-bottom.
-        # Để chính xác tuyệt đối trái-phải, cần gom nhóm theo hàng (row).
-        
-        # Logic đơn giản: Cắt từng ô và nhận diện
         for c in valid_contours:
             x, y, w, h = cv2.boundingRect(c)
             
-            # Cắt ảnh (Crop) vùng ô trắng (thêm margin nhỏ để tránh mất nét)
-            roi = img[y+5:y+h-5, x+5:x+w-5] 
+            # --- SỬA LỖI Ở ĐÂY: Xử lý cắt ảnh an toàn hơn ---
+            # Đảm bảo không cắt lẹm vào quá sâu khiến ảnh bị rỗng
+            pad = 5
+            # Kiểm tra nếu ô quá nhỏ thì không trừ margin nữa
+            if h <= 2*pad or w <= 2*pad:
+                roi = img[y:y+h, x:x+w]
+            else:
+                roi = img[y+pad:y+h-pad, x+pad:x+w-pad] 
             
-            # Xử lý ảnh con để OCR tốt hơn
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            _, roi_thresh = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # --- KIỂM TRA QUAN TRỌNG ---
+            # Nếu roi rỗng (size = 0) thì bỏ qua ngay, không đưa vào cvtColor
+            if roi.size == 0:
+                continue
             
-            # Dùng Tesseract để đọc
-            # config='--psm 6' phù hợp cho khối văn bản đơn dòng
-            text = pytesseract.image_to_string(roi_thresh, config='--psm 6')
-            
-            cleaned = clean_text(text)
-            
-            if cleaned: # Chỉ thêm nếu đọc được chữ
-                detected_codes.append(cleaned)
+            try:
+                # Xử lý ảnh con
+                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                _, roi_thresh = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 
-                # Vẽ hình chữ nhật lên ảnh gốc để visualize (tùy chọn)
-                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cv2.putText(img, cleaned, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                # Dùng Tesseract
+                text = pytesseract.image_to_string(roi_thresh, config='--psm 6')
+                cleaned = clean_text(text)
+                
+                if cleaned:
+                    detected_codes.append(cleaned)
+                    # Vẽ khung xanh
+                    cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                    cv2.putText(img, cleaned, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            except Exception as e:
+                # Nếu lỗi ở một ô nào đó, in ra console và tiếp tục ô khác chứ không dừng app
+                print(f"Lỗi xử lý 1 ô: {e}")
+                continue
 
     return img, detected_codes
 
@@ -135,3 +133,4 @@ if uploaded_file is not None:
                 st.code(code, language="text")
         else:
             st.warning("Không tìm thấy mã nào. Hãy thử ảnh rõ nét hơn.")
+
