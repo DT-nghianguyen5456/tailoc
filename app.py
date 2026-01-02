@@ -1,119 +1,137 @@
 import streamlit as st
 import cv2
 import numpy as np
-import pytesseract
 from PIL import Image
+import pytesseract
 import re
 
-st.set_page_config(page_title="Tool Lọc Code OKVIP", page_icon="⚡")
+# ==========================================
+# CẤU HÌNH TESSERACT (CHỈ DÀNH CHO WINDOWS)
+# Nếu bạn dùng Linux/Mac hoặc đã thêm vào PATH thì bỏ qua dòng này
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# ==========================================
 
-# Hàm làm sạch: Xóa mọi ký tự đặc biệt, chỉ giữ Chữ và Số
 def clean_text(text):
-    return re.sub(r'[^a-zA-Z0-9]', '', text)
+    """
+    Hàm lọc text: Chuyển thành chữ in hoa và xóa hết ký tự đặc biệt.
+    Ví dụ: '9.B~4~U|J,D' -> '9B4UJD'
+    """
+    # Chỉ giữ lại ký tự chữ (a-z, A-Z) và số (0-9)
+    cleaned = re.sub(r'[^a-zA-Z0-9]', '', text)
+    return cleaned.upper()
+
+def sort_contours(cnts, method="left-to-right"):
+    """
+    Hàm sắp xếp vị trí các ô để đọc theo thứ tự từ trái qua phải, trên xuống dưới.
+    """
+    reverse = False
+    i = 0
+    if method == "right-to-left" or method == "bottom-to-top":
+        reverse = True
+    if method == "top-to-bottom" or method == "bottom-to-top":
+        i = 1
+    
+    boundingBoxes = [cv2.boundingRect(c) for c in cnts]
+    (cnts, boundingBoxes) = zip(*sorted(zip(cnts, boundingBoxes),
+        key=lambda b:b[1][i], reverse=reverse))
+    return (cnts, boundingBoxes)
 
 def process_image(image_file):
-    # 1. Đọc ảnh từ upload
+    # Đọc ảnh từ file upload
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, 1)
+    img = cv2.imdecode(file_bytes, 1)
     
-    # 2. Xử lý ảnh để tìm khung (Pre-processing)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Chuyển sang ảnh xám
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Nhị phân hóa: Lấy vùng màu trắng sáng (>180)
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    # Phân ngưỡng (Threshold) để tách phần màu trắng
+    # Các ô màu trắng sẽ có giá trị cao (gần 255)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     
-    # --- KỸ THUẬT QUAN TRỌNG: MORPHOLOGICAL CLOSING ---
-    # Lệnh này giúp "hàn gắn" các chữ đen bên trong ô trắng.
-    # Biến cả ô code thành 1 khối hình chữ nhật đặc màu trắng.
-    # Giúp giảm số lượng contour từ 1300 xuống còn đúng số lượng ô code (khoảng 20).
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    # Tìm các đường viền (contours)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Tìm viền
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    valid_boxes = []
+    detected_codes = []
+    valid_contours = []
+
+    # Lọc các contour để tìm đúng ô chứa mã
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
+        aspect_ratio = w / float(h)
         
-        # BỘ LỌC KÍCH THƯỚC:
-        # - w > h: Ô code nằm ngang
-        # - w > 50: Chiều rộng phải đủ lớn (tránh nhiễu)
-        # - area > 1000: Diện tích phải lớn
-        if w > h and w > 50 and h > 20 and area > 1000:
-            valid_boxes.append((x, y, w, h))
+        # Điều kiện lọc: Diện tích phải đủ lớn và hình dáng chữ nhật ngang
+        # Bạn có thể điều chỉnh số 2000 tùy theo độ phân giải ảnh
+        if area > 2000 and aspect_ratio > 2.0:
+            valid_contours.append(c)
+
+    # Sắp xếp contour từ trên xuống dưới để đọc đúng thứ tự
+    if valid_contours:
+        # Sắp xếp sơ bộ từ trên xuống dưới
+        (valid_contours, _) = sort_contours(valid_contours, method="top-to-bottom")
+        
+        # Xử lý gom nhóm từng hàng (để sắp xếp trái sang phải trong cùng 1 hàng)
+        sorted_final = []
+        # Giả sử mỗi hàng cao khoảng h pixels, ta gom nhóm các contour có y gần nhau
+        # (Đây là logic đơn giản hóa, với lưới đều nhau thì ổn)
+        # Để đơn giản cho demo, ta dùng logic sắp xếp theo tọa độ Y trước, 
+        # sau đó gom nhóm các box có Y gần nhau để sort theo X.
+        
+        # NOTE: Với lưới Grid rõ ràng như ảnh, ta có thể dùng thư viện imutils hoặc logic custom.
+        # Ở đây mình dùng logic đọc tuần tự theo bounding box đã sort top-to-bottom.
+        # Để chính xác tuyệt đối trái-phải, cần gom nhóm theo hàng (row).
+        
+        # Logic đơn giản: Cắt từng ô và nhận diện
+        for c in valid_contours:
+            x, y, w, h = cv2.boundingRect(c)
             
-    # --- SAFETY LOCK (CHỐNG TREO MÁY) ---
-    # Chỉ lấy tối đa 20 ô có diện tích lớn nhất.
-    # Đảm bảo dù ảnh nhiễu đến đâu cũng không bao giờ bị treo.
-    if len(valid_boxes) > 20:
-        valid_boxes = sorted(valid_boxes, key=lambda b: b[2]*b[3], reverse=True)[:20]
-    
-    # Sắp xếp các ô từ trên xuống dưới, trái qua phải
-    valid_boxes.sort(key=lambda b: (b[1] // 40, b[0])) 
-
-    results = []
-    
-    # 3. Đọc OCR từng ô
-    for (x, y, w, h) in valid_boxes:
-        # Cắt vùng ảnh gốc (lấy từ ảnh gray để rõ nét)
-        roi = gray[y:y+h, x:x+w]
-        
-        # Phóng to ảnh lên 2 lần để đọc chữ rõ hơn
-        roi = cv2.resize(roi, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        
-        # Otsu Threshold để tách chữ đen trên nền trắng tuyệt đối
-        _, roi = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Thêm viền trắng xung quanh (Padding) để Tesseract không bị mất chữ sát lề
-        roi = cv2.copyMakeBorder(roi, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=[255])
-        
-        # Cấu hình Tesseract:
-        # --psm 7: Coi là 1 dòng đơn
-        # whitelist: Chỉ cho phép nhận diện A-Z và 0-9
-        config = '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        text = pytesseract.image_to_string(roi, config=config)
-        
-        # Dùng thêm Python Regex để lọc sạch lần cuối
-        cleaned = clean_text(text)
-        
-        # Chỉ lấy kết quả nếu dài hơn 3 ký tự
-        if len(cleaned) > 3:
-            results.append(cleaned)
+            # Cắt ảnh (Crop) vùng ô trắng (thêm margin nhỏ để tránh mất nét)
+            roi = img[y+5:y+h-5, x+5:x+w-5] 
             
-    return results
+            # Xử lý ảnh con để OCR tốt hơn
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, roi_thresh = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Dùng Tesseract để đọc
+            # config='--psm 6' phù hợp cho khối văn bản đơn dòng
+            text = pytesseract.image_to_string(roi_thresh, config='--psm 6')
+            
+            cleaned = clean_text(text)
+            
+            if cleaned: # Chỉ thêm nếu đọc được chữ
+                detected_codes.append(cleaned)
+                
+                # Vẽ hình chữ nhật lên ảnh gốc để visualize (tùy chọn)
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                cv2.putText(img, cleaned, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
-# --- GIAO DIỆN WEB ---
-st.title("⚡ Tool Quét Code OKVIP (Bản V5)")
-st.info("Đã sửa lỗi treo máy và tối ưu nhận diện ký tự đặc biệt.")
+    return img, detected_codes
 
-uploaded_file = st.file_uploader("Chọn ảnh để quét...", type=["jpg", "png", "jpeg"])
+# --- GIAO DIỆN STREAMLIT ---
+st.set_page_config(page_title="Trích xuất Mã Code", layout="wide")
+
+st.title("🧩 Công cụ Trích xuất & Lọc Mã Code")
+st.markdown("Tải ảnh lên để nhận diện các ô trắng, lọc ký tự đặc biệt và lấy mã code.")
+
+uploaded_file = st.file_uploader("Chọn ảnh chứa mã code...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    st.image(uploaded_file, caption='Ảnh đã tải lên', use_container_width=True)
+    col1, col2 = st.columns([1, 1])
     
-    if st.button('🚀 Bắt đầu quét ngay'):
-        with st.spinner('Đang xử lý hình ảnh...'):
-            try:
-                codes = process_image(uploaded_file)
-                
-                if codes:
-                    st.success(f"Hoàn tất! Tìm thấy {len(codes)} mã code.")
-                    st.markdown("---")
-                    
-                    # Hiển thị kết quả dạng lưới 2 cột
-                    col1, col2 = st.columns(2)
-                    for i, code in enumerate(codes):
-                        # Chia cột hiển thị
-                        if i % 2 == 0:
-                            with col1:
-                                st.code(code, language=None)
-                        else:
-                            with col2:
-                                st.code(code, language=None)
-                else:
-                    st.warning("Không tìm thấy mã nào hợp lệ. Hãy thử cắt ảnh gọn hơn.")
-                    
-            except Exception as e:
-                st.error(f"Có lỗi xảy ra: {e}")
+    with col1:
+        st.subheader("Ảnh gốc & Nhận diện")
+        processed_img, codes = process_image(uploaded_file)
+        # Chuyển đổi màu BGR sang RGB để hiển thị đúng trên Streamlit
+        st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption="Các ô đã nhận diện (Khung xanh)", use_container_width=True)
+
+    with col2:
+        st.subheader("Kết quả Code đã lọc")
+        if codes:
+            st.success(f"Tìm thấy {len(codes)} mã code.")
+            st.markdown("---")
+            for idx, code in enumerate(codes):
+                # Hiển thị từng code kèm nút copy
+                st.markdown(f"**Code #{idx+1}**")
+                st.code(code, language="text")
+        else:
+            st.warning("Không tìm thấy mã nào. Hãy thử ảnh rõ nét hơn.")
